@@ -63,7 +63,7 @@ def explain_message(message) -> str:
 
 st.set_page_config(page_title="Telecom Trace Analyzer", page_icon="📡", layout="wide")
 st.title("📡 Telecom Trace Analyzer")
-st.caption("V1.1 — PCAP → robust SIP extraction → transaction & call-flow inspection")
+st.caption("V1.2 — payload-first SIP extraction → transaction & call-flow inspection")
 
 uploaded = st.file_uploader("Upload a PCAP / PCAPNG file", type=["pcap", "pcapng"])
 
