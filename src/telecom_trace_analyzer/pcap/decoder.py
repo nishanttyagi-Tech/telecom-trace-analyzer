@@ -1,4 +1,4 @@
-"""PCAP decoding adapter using TShark with transport-payload SIP recovery."""
+"""PCAP decoding adapter using TShark with raw packet SIP recovery."""
 
 from __future__ import annotations
 
@@ -98,7 +98,6 @@ def _decode_hex(value: str) -> str:
 
 
 def _parse_raw_sip(text: str) -> SipMessage | None:
-    """Parse one complete plaintext SIP message."""
     text = text.replace("\x00", "")
     lines = text.replace("\r\n", "\n").split("\n")
     while lines and not lines[0].strip():
@@ -159,7 +158,7 @@ def _parse_raw_sip(text: str) -> SipMessage | None:
 
 
 def _extract_sip_messages(text: str) -> list[SipMessage]:
-    """Extract every SIP message start found in a payload/stream."""
+    """Extract every SIP message start found in a decoded payload/stream."""
     text = text.replace("\r\n", "\n")
     pattern = re.compile(
         r"^(?:REGISTER|INVITE|ACK|BYE|CANCEL|PRACK|UPDATE|SUBSCRIBE|NOTIFY|OPTIONS|REFER)\s+\S+\s+SIP/2\.0\s*$|^SIP/2\.0\s+\d{3}(?:\s+.*)?$",
@@ -184,8 +183,41 @@ def _run_tshark(tshark: str, path: Path, display_filter: str | None) -> list[dic
     return json.loads(result.stdout or "[]")
 
 
+def _run_raw_json(tshark: str, path: Path) -> list[dict[str, Any]]:
+    """Read packet bytes from TShark JSON when transport payload fields are unavailable."""
+    command = [tshark, "-2", "-n", "-r", str(path), "-T", "jsonraw", "-x"]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    return json.loads(result.stdout or "[]")
+
+
+def _strings_from_tree(value: Any) -> list[str]:
+    found: list[str] = []
+    if isinstance(value, str):
+        found.append(value)
+    elif isinstance(value, dict):
+        for child in value.values():
+            found.extend(_strings_from_tree(child))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(_strings_from_tree(child))
+    return found
+
+
+def _raw_packet_candidates(packet: dict[str, Any]) -> list[str]:
+    """Return decoded text candidates from raw JSON packet-byte fields."""
+    candidates: list[str] = []
+    for value in _strings_from_tree(packet):
+        # JSONRAW commonly contains hex strings. Decode only plausible byte strings.
+        compact = re.sub(r"[^0-9A-Fa-f]", "", value)
+        if len(compact) < 20 or len(compact) % 2:
+            continue
+        text = _decode_hex(compact)
+        if "SIP/2.0" in text or re.search(r"\b(?:REGISTER|INVITE|ACK|BYE|CANCEL|PRACK|UPDATE|SUBSCRIBE|NOTIFY|OPTIONS|REFER)\s+sip:", text, re.I):
+            candidates.append(text)
+    return candidates
+
+
 def _run_transport_fields(tshark: str, path: Path) -> list[dict[str, str]]:
-    """Extract raw UDP/TCP payloads explicitly; JSON protocol trees are not reliable for this."""
     fields = [
         "frame.number", "frame.time_epoch", "ip.src", "ip.dst", "ipv6.src", "ipv6.dst",
         "udp.srcport", "udp.dstport", "@udp.payload",
@@ -214,7 +246,7 @@ def _row_metadata(row: dict[str, str]) -> tuple[int | None, float | None, str | 
 
 
 def decode_sip_messages(pcap_path: str | Path) -> list[SipMessage]:
-    """Decode SIP using TShark and recover missed SIP directly from transport payloads."""
+    """Decode SIP using TShark and multiple recovery paths."""
     tshark = shutil.which("tshark")
     if not tshark:
         raise TsharkNotFoundError("tshark was not found. Install Wireshark/tshark and make sure it is on PATH.")
@@ -246,9 +278,10 @@ def decode_sip_messages(pcap_path: str | Path) -> list[SipMessage]:
     except subprocess.CalledProcessError:
         rows = []
 
-    # UDP is message-oriented, so parse each datagram independently.
     for row in rows:
         payload = _decode_hex(row.get("@udp.payload", ""))
+        if not payload:
+            payload = _decode_hex(row.get("@tcp.payload", ""))
         if not payload:
             continue
         frame, timestamp, source, destination = _row_metadata(row)
@@ -260,56 +293,27 @@ def decode_sip_messages(pcap_path: str | Path) -> list[SipMessage]:
             if frame is not None:
                 seen_frames.add(frame)
 
-    # TCP is stream-oriented. Reassemble captured payload segments per direction.
-    tcp_streams: dict[tuple[str, str, str, str], list[tuple[int, int, str]]] = {}
-    for row in rows:
-        payload_hex = row.get("@tcp.payload", "")
-        if not payload_hex or not row.get("tcp.stream") or not row.get("tcp.seq"):
-            continue
-        frame, _, source, destination = _row_metadata(row)
-        if frame is None or not source or not destination:
-            continue
-        key = (row["tcp.stream"], source, destination, row.get("tcp.srcport", ""))
-        try:
-            seq = int(row["tcp.seq"])
-        except ValueError:
-            continue
-        tcp_streams.setdefault(key, []).append((seq, frame, payload_hex))
+    # Last-resort recovery: scan the actual packet bytes. This handles captures where
+    # TShark exposes neither udp.payload nor tcp.payload in the fields interface.
+    try:
+        raw_packets = _run_raw_json(tshark, path)
+    except subprocess.CalledProcessError:
+        raw_packets = []
 
-    for segments in tcp_streams.values():
-        stream_bytes = bytearray()
-        frame_for_offset: list[tuple[int, int]] = []
-        last_end: int | None = None
-        for seq, frame, payload_hex in sorted(segments, key=lambda item: (item[0], item[1])):
-            try:
-                data = bytes.fromhex(re.sub(r"[^0-9A-Fa-f]", "", payload_hex))
-            except ValueError:
-                continue
-            if not data:
-                continue
-            if last_end is not None and seq < last_end:
-                overlap = last_end - seq
-                if overlap >= len(data):
-                    continue
-                data = data[overlap:]
-                seq = last_end
-            if last_end is not None and seq > last_end:
-                stream_bytes = bytearray()
-                frame_for_offset = []
-            offset = len(stream_bytes)
-            stream_bytes.extend(data)
-            frame_for_offset.append((offset, frame))
-            last_end = seq + len(data)
-
-        text = stream_bytes.decode("utf-8", errors="ignore")
-        for message in _extract_sip_messages(text):
-            start_frame = frame_for_offset[0][1] if frame_for_offset else None
-            if start_frame is not None and start_frame in seen_frames:
-                continue
-            message.frame = start_frame
-            messages.append(message)
-            if start_frame is not None:
-                seen_frames.add(start_frame)
+    for packet in raw_packets:
+        layers = packet.get("_source", {}).get("layers", {})
+        fields = _collect_fields(layers)
+        frame, timestamp, source, destination = _packet_metadata(fields)
+        if frame is not None and frame in seen_frames:
+            continue
+        for candidate in _raw_packet_candidates(packet):
+            for message in _extract_sip_messages(candidate):
+                if frame is not None and frame in seen_frames:
+                    break
+                message.frame, message.timestamp, message.source, message.destination = frame, timestamp, source, destination
+                messages.append(message)
+                if frame is not None:
+                    seen_frames.add(frame)
 
     unique: dict[tuple[int | None, str, str | None], SipMessage] = {}
     for message in messages:
