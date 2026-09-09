@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 from telecom_trace_analyzer.sip.models import SipMessage
-from telecom_trace_analyzer.sip.parser import parse_sip_message
 
 
 class TsharkNotFoundError(RuntimeError):
@@ -21,26 +20,76 @@ def _first(value: Any) -> Any:
     return value[0] if isinstance(value, list) and value else value
 
 
-def _walk_fields(value: Any, names: set[str]) -> dict[str, Any]:
-    """Find selected field names in Wireshark's nested JSON representation."""
-    found: dict[str, Any] = {}
+def _collect_fields(value: Any, result: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Flatten Wireshark JSON fields, keeping the first value for each name."""
+    result = result or {}
     if isinstance(value, dict):
         for key, child in value.items():
-            if key in names and key not in found:
-                found[key] = _first(child)
-            found.update({k: v for k, v in _walk_fields(child, names).items() if k not in found})
+            if key not in result:
+                result[key] = _first(child)
+            _collect_fields(child, result)
     elif isinstance(value, list):
         for child in value:
-            found.update({k: v for k, v in _walk_fields(child, names).items() if k not in found})
-    return found
+            _collect_fields(child, result)
+    return result
+
+
+def _header(fields: dict[str, Any], *names: str) -> str | None:
+    for name in names:
+        value = fields.get(name)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _build_message(fields: dict[str, Any]) -> SipMessage | None:
+    request_line = _header(fields, "sip.Request-Line")
+    status_line = _header(fields, "sip.Status-Line")
+
+    if request_line:
+        method = request_line.split(" ", 1)[0]
+        start_line = request_line
+        message_type = "request"
+        status_code = None
+        reason = None
+    elif status_line:
+        parts = status_line.split(" ", 2)
+        if len(parts) < 2 or not parts[1].isdigit():
+            return None
+        method = None
+        start_line = status_line
+        message_type = "response"
+        status_code = int(parts[1])
+        reason = parts[2] if len(parts) > 2 else ""
+    else:
+        return None
+
+    headers = {
+        "call-id": _header(fields, "sip.Call-ID", "sip.call_id"),
+        "cseq": _header(fields, "sip.CSeq"),
+        "from": _header(fields, "sip.From"),
+        "to": _header(fields, "sip.To"),
+        "via": _header(fields, "sip.Via"),
+        "contact": _header(fields, "sip.Contact"),
+        "content-type": _header(fields, "sip.Content-Type"),
+        "require": _header(fields, "sip.Require"),
+        "supported": _header(fields, "sip.Supported"),
+        "www-authenticate": _header(fields, "sip.WWW-Authenticate"),
+    }
+    headers = {key: value for key, value in headers.items() if value is not None}
+
+    return SipMessage(
+        start_line=start_line,
+        message_type=message_type,
+        method=method,
+        status_code=status_code,
+        reason=reason,
+        headers=headers,
+    )
 
 
 def decode_sip_messages(pcap_path: str | Path) -> list[SipMessage]:
-    """Decode SIP packets from a PCAP/PCAPNG file using tshark's JSON output.
-
-    This adapter deliberately keeps packet decoding separate from SIP analysis.
-    It is therefore replaceable later if another decoder is needed.
-    """
+    """Decode SIP packets from a PCAP/PCAPNG file using tshark JSON output."""
     tshark = shutil.which("tshark")
     if not tshark:
         raise TsharkNotFoundError(
@@ -62,21 +111,9 @@ def decode_sip_messages(pcap_path: str | Path) -> list[SipMessage]:
 
     for packet in packets:
         layers = packet.get("_source", {}).get("layers", {})
-        fields = _walk_fields(layers, {
-            "frame.number", "frame.time_epoch", "ip.src", "ipv6.src",
-            "ip.dst", "ipv6.dst", "sip.Request-Line", "sip.Status-Line",
-            "sip.msg_hdr", "sip.msg_body",
-        })
-
-        start_line = fields.get("sip.Request-Line") or fields.get("sip.Status-Line")
-        if not start_line:
-            continue
-
-        try:
-            message = parse_sip_message(str(start_line))
-        except ValueError:
-            # Wireshark already decoded the packet; keep this adapter tolerant of
-            # unusual SIP dissector output until packet fixtures are expanded.
+        fields = _collect_fields(layers)
+        message = _build_message(fields)
+        if message is None:
             continue
 
         message.frame = int(fields["frame.number"]) if fields.get("frame.number") else None
