@@ -1,7 +1,9 @@
-"""PCAP decoding adapter using TShark with a raw-SIP fallback."""
+"""PCAP decoding adapter using TShark with robust SIP payload fallback."""
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import re
 import shutil
@@ -112,7 +114,20 @@ def _decode_payload(value: Any) -> str:
         try:
             raw = bytes.fromhex(compact)
             text = raw.decode("utf-8", errors="ignore")
-            if any(token in text for token in ("SIP/2.0", "REGISTER ", "INVITE ", "ACK ", "BYE ", "CANCEL ", "OPTIONS ", "SUBSCRIBE ", "NOTIFY ")):
+            if any(
+                token in text
+                for token in (
+                    "SIP/2.0",
+                    "REGISTER ",
+                    "INVITE ",
+                    "ACK ",
+                    "BYE ",
+                    "CANCEL ",
+                    "OPTIONS ",
+                    "SUBSCRIBE ",
+                    "NOTIFY ",
+                )
+            ):
                 return text
         except ValueError:
             pass
@@ -129,7 +144,13 @@ def _raw_sip_from_fields(fields: dict[str, Any]) -> str:
     ]
     for candidate in candidates:
         text = _decode_payload(candidate)
-        if text and ("SIP/2.0" in text or re.search(r"\b(?:REGISTER|INVITE|ACK|BYE|CANCEL|PRACK|UPDATE|SUBSCRIBE|NOTIFY|OPTIONS|REFER)\s+sip:", text)):
+        if text and (
+            "SIP/2.0" in text
+            or re.search(
+                r"\b(?:REGISTER|INVITE|ACK|BYE|CANCEL|PRACK|UPDATE|SUBSCRIBE|NOTIFY|OPTIONS|REFER)\s+sip:",
+                text,
+            )
+        ):
             return text
     return ""
 
@@ -143,7 +164,10 @@ def _parse_raw_sip(text: str) -> SipMessage | None:
         return None
 
     start_line = lines[0].strip()
-    request_match = re.match(r"^(REGISTER|INVITE|ACK|BYE|CANCEL|PRACK|UPDATE|SUBSCRIBE|NOTIFY|OPTIONS|REFER)\s+\S+\s+SIP/2\.0$", start_line)
+    request_match = re.match(
+        r"^(REGISTER|INVITE|ACK|BYE|CANCEL|PRACK|UPDATE|SUBSCRIBE|NOTIFY|OPTIONS|REFER)\s+\S+\s+SIP/2\.0$",
+        start_line,
+    )
     response_match = re.match(r"^SIP/2\.0\s+(\d{3})(?:\s+(.*))?$", start_line)
     if request_match:
         message_type = "request"
@@ -204,7 +228,8 @@ def _parse_raw_sip(text: str) -> SipMessage | None:
 
 
 def _run_tshark(tshark: str, path: Path, display_filter: str | None) -> list[dict[str, Any]]:
-    command = [tshark, "-n", "-r", str(path)]
+    """Run TShark JSON dissection, using two-pass decoding for reassembly."""
+    command = [tshark, "-n", "-2", "-r", str(path)]
     if display_filter:
         command += ["-Y", display_filter]
     command += ["-T", "json"]
@@ -212,8 +237,64 @@ def _run_tshark(tshark: str, path: Path, display_filter: str | None) -> list[dic
     return json.loads(result.stdout or "[]")
 
 
+def _run_payload_fields(tshark: str, path: Path) -> list[dict[str, str]]:
+    """Extract transport payload bytes directly, independent of SIP dissection."""
+    command = [
+        tshark,
+        "-n",
+        "-r",
+        str(path),
+        "-T",
+        "fields",
+        "-E",
+        "separator=\t",
+        "-E",
+        "quote=n",
+        "-E",
+        "occurrence=f",
+        "-e",
+        "frame.number",
+        "-e",
+        "frame.time_epoch",
+        "-e",
+        "ip.src",
+        "-e",
+        "ipv6.src",
+        "-e",
+        "ip.dst",
+        "-e",
+        "ipv6.dst",
+        "-e",
+        "@udp.payload",
+        "-e",
+        "@tcp.payload",
+        "-e",
+        "@data.data",
+    ]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    rows: list[dict[str, str]] = []
+    reader = csv.DictReader(
+        io.StringIO(
+            "frame.number\tframe.time_epoch\tip.src\tipv6.src\tip.dst\tipv6.dst\t@udp.payload\t@tcp.payload\t@data.data\n"
+            + result.stdout
+        ),
+        delimiter="\t",
+    )
+    for row in reader:
+        rows.append(row)
+    return rows
+
+
+def _payload_row_metadata(row: dict[str, str]) -> tuple[int | None, float | None, str | None, str | None]:
+    frame = int(row["frame.number"]) if row.get("frame.number") else None
+    timestamp = float(row["frame.time_epoch"]) if row.get("frame.time_epoch") else None
+    source = row.get("ip.src") or row.get("ipv6.src") or None
+    destination = row.get("ip.dst") or row.get("ipv6.dst") or None
+    return frame, timestamp, source, destination
+
+
 def decode_sip_messages(pcap_path: str | Path) -> list[SipMessage]:
-    """Decode SIP packets using TShark, with a raw-payload fallback."""
+    """Decode SIP packets using TShark, with a transport-payload fallback."""
     tshark = shutil.which("tshark")
     if not tshark:
         raise TsharkNotFoundError(
@@ -227,7 +308,7 @@ def decode_sip_messages(pcap_path: str | Path) -> list[SipMessage]:
     messages: list[SipMessage] = []
     seen_frames: set[int] = set()
 
-    # Primary path: use TShark's SIP dissector. This is fast and gives rich SIP fields.
+    # Primary path: use TShark's SIP dissector. Two-pass mode improves TCP reassembly.
     sip_packets = _run_tshark(tshark, path, "sip")
     for packet in sip_packets:
         layers = packet.get("_source", {}).get("layers", {})
@@ -240,23 +321,35 @@ def decode_sip_messages(pcap_path: str | Path) -> list[SipMessage]:
         if message.frame is not None:
             seen_frames.add(message.frame)
 
-    # Fallback: some cloud TShark builds/preferences may not dissect every SIP packet.
-    # Read all packets and recover plaintext SIP from raw transport payloads.
-    all_packets = _run_tshark(tshark, path, None)
-    for packet in all_packets:
-        layers = packet.get("_source", {}).get("layers", {})
-        fields = _collect_fields(layers)
-        frame, timestamp, source, destination = _packet_metadata(fields)
+    # Strong fallback: ask TShark for raw UDP/TCP/data bytes directly. This does not
+    # depend on whether its SIP heuristic dissector recognizes a given packet.
+    for row in _run_payload_fields(tshark, path):
+        frame, timestamp, source, destination = _payload_row_metadata(row)
         if frame is not None and frame in seen_frames:
             continue
 
-        raw_text = _raw_sip_from_fields(fields)
+        raw_text = ""
+        for key in ("@udp.payload", "@tcp.payload", "@data.data"):
+            candidate = row.get(key, "")
+            if not candidate:
+                continue
+            text = _decode_payload(candidate)
+            if text and (
+                "SIP/2.0" in text
+                or re.search(
+                    r"\b(?:REGISTER|INVITE|ACK|BYE|CANCEL|PRACK|UPDATE|SUBSCRIBE|NOTIFY|OPTIONS|REFER)\s+sip:",
+                    text,
+                )
+            ):
+                raw_text = text
+                break
+
         if not raw_text:
             continue
+
         message = _parse_raw_sip(raw_text)
         if message is None:
             continue
-
         message.frame = frame
         message.timestamp = timestamp
         message.source = source
