@@ -19,6 +19,7 @@ from telecom_trace_analyzer.sip.analyzer import (
     diagnose_flows,
     find_sip_errors,
     group_by_call_id,
+    is_authentication_challenge,
     summarize_message,
 )
 
@@ -27,7 +28,7 @@ def explain_message(message) -> str:
     """Return a deterministic, telecom-friendly explanation of a SIP message."""
     if message.is_request:
         descriptions = {
-            "REGISTER": "Registers the UE/contact with the IMS registrar. Check authentication and the final response.",
+            "REGISTER": "Registers the UE/contact with the IMS registrar. A 401/407 challenge may be expected before an authenticated REGISTER is accepted.",
             "INVITE": "Initiates a SIP session. In IMS this normally carries SDP describing the proposed media session.",
             "ACK": "Confirms receipt of the final response to an INVITE transaction and completes the INVITE handshake.",
             "BYE": "Terminates an established SIP session.",
@@ -43,6 +44,8 @@ def explain_message(message) -> str:
 
     if message.is_response:
         code = message.status_code or 0
+        if code in {401, 407}:
+            return "Authentication challenge. In an IMS REGISTER flow this is normally expected: inspect WWW-Authenticate/Proxy-Authenticate, then verify that the UE sends an authenticated follow-up request and receives the expected final response."
         if 100 <= code < 200:
             return "Provisional response. The transaction is still in progress; inspect the next request/response and any reliable provisional-response handling."
         if 200 <= code < 300:
@@ -83,6 +86,7 @@ with tempfile.TemporaryDirectory(prefix="telecom_trace_") as tmp:
 
 flows = group_by_call_id(messages)
 errors = find_sip_errors(messages)
+auth_challenges = [m for m in messages if is_authentication_challenge(m)]
 diagnostics = diagnose_flows(flows)
 
 st.success(f"Analysis complete: {len(messages)} SIP messages found.")
@@ -90,9 +94,12 @@ st.success(f"Analysis complete: {len(messages)} SIP messages found.")
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("SIP messages", len(messages))
 m2.metric("Call-ID flows", len(flows))
-m3.metric("SIP errors", len(errors))
-m4.metric("Requests", sum(m.is_request for m in messages))
+m3.metric("Actual SIP failures", len(errors))
+m4.metric("Auth challenges", len(auth_challenges))
 m5.metric("Diagnostics", len(diagnostics))
+
+if auth_challenges:
+    st.info(f"{len(auth_challenges)} authentication challenge(s) detected (401/407). These are not counted as SIP failures by the analyzer.")
 
 st.subheader("SIP message explorer")
 filter_text = st.text_input("Filter messages", placeholder="e.g. INVITE, 401, PRACK, Call-ID")
@@ -208,4 +215,4 @@ if errors:
             f"CSeq: {message.cseq or 'N/A'}"
         )
 else:
-    st.success("No 4xx, 5xx or 6xx SIP responses detected.")
+    st.success("No actual SIP 4xx/5xx/6xx failures detected. Normal 401/407 authentication challenges are excluded.")
