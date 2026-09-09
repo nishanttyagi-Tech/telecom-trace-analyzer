@@ -21,8 +21,12 @@ def _first(value: Any) -> Any:
 
 
 def _collect_fields(value: Any, result: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Flatten Wireshark JSON fields, keeping the first value for each name."""
-    result = result or {}
+    """Flatten Wireshark JSON fields while preserving the shared result dictionary."""
+    # Do not use ``result or {}``: an empty accumulator is valid and replacing it
+    # during recursion can silently lose fields depending on JSON ordering.
+    if result is None:
+        result = {}
+
     if isinstance(value, dict):
         for key, child in value.items():
             if key not in result:
