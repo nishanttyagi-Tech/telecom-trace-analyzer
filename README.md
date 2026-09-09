@@ -6,6 +6,51 @@
 
 Telecom Trace Analyzer is being developed as a protocol-aware debugging platform for engineers working with packet captures and telecom signaling. The first release focuses on SIP/IMS traces, with a design that can later expand to LTE and 5G protocols.
 
+## V1 — PCAP to SIP analyzer
+
+The first usable milestone provides a local Streamlit interface that:
+
+- accepts `.pcap` and `.pcapng` files
+- uses `tshark` for packet decoding
+- extracts SIP requests/responses and key headers
+- groups messages by Call-ID
+- shows a readable SIP message table
+- shows SIP flows
+- flags 4xx/5xx/6xx SIP responses
+
+AI explanations, working-vs-failing trace comparison and RFS validation will be added after the deterministic analysis layer is stable.
+
+## Run locally
+
+### 1. Install Wireshark
+
+Install Wireshark with the **TShark** command-line component and make sure `tshark` is available from a terminal.
+
+Verify:
+
+```text
+tshark --version
+```
+
+### 2. Create a Python environment
+
+Python 3.11 or newer is required.
+
+```text
+python -m venv .venv
+.venv\\Scripts\\activate
+python -m pip install -e .
+pip install -r requirements.txt
+```
+
+### 3. Start the analyzer
+
+```text
+streamlit run app.py
+```
+
+A browser window will open. Upload a **sanitized or synthetic** PCAP/PCAPNG and the current V1 analyzer will extract the SIP traffic.
+
 ## Planned capabilities
 
 - PCAP/PCAPNG ingestion and packet indexing
@@ -23,10 +68,6 @@ Telecom Trace Analyzer is being developed as a protocol-aware debugging platform
 **Deterministic protocol parsing first, AI explanation second.**
 
 The analyzer should establish what happened from packet evidence before an AI layer explains why it matters. Answers should be traceable to packet/frame evidence whenever possible.
-
-## Project status
-
-🚧 Early development — V1 is focused on the PCAP → SIP extraction → SIP call-flow pipeline.
 
 ## Planned architecture
 
