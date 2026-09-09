@@ -1,4 +1,4 @@
-"""Local Streamlit UI for the first PCAP/SIP analysis milestone."""
+"""Local Streamlit UI for the Telecom Trace Analyzer."""
 
 from __future__ import annotations
 
@@ -14,7 +14,13 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from telecom_trace_analyzer.pcap.decoder import TsharkNotFoundError, decode_sip_messages
-from telecom_trace_analyzer.sip.analyzer import find_sip_errors, group_by_call_id, summarize_message
+from telecom_trace_analyzer.sip.analyzer import (
+    diagnose_flow,
+    diagnose_flows,
+    find_sip_errors,
+    group_by_call_id,
+    summarize_message,
+)
 
 
 def explain_message(message) -> str:
@@ -54,7 +60,7 @@ def explain_message(message) -> str:
 
 st.set_page_config(page_title="Telecom Trace Analyzer", page_icon="📡", layout="wide")
 st.title("📡 Telecom Trace Analyzer")
-st.caption("V1 — PCAP → SIP extraction → call-flow inspection")
+st.caption("V1 — PCAP → SIP extraction → transaction & call-flow inspection")
 
 uploaded = st.file_uploader("Upload a PCAP / PCAPNG file", type=["pcap", "pcapng"])
 
@@ -77,17 +83,18 @@ with tempfile.TemporaryDirectory(prefix="telecom_trace_") as tmp:
 
 flows = group_by_call_id(messages)
 errors = find_sip_errors(messages)
+diagnostics = diagnose_flows(flows)
 
 st.success(f"Analysis complete: {len(messages)} SIP messages found.")
 
-m1, m2, m3, m4 = st.columns(4)
+m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("SIP messages", len(messages))
 m2.metric("Call-ID flows", len(flows))
 m3.metric("SIP errors", len(errors))
 m4.metric("Requests", sum(m.is_request for m in messages))
+m5.metric("Diagnostics", len(diagnostics))
 
 st.subheader("SIP message explorer")
-
 filter_text = st.text_input("Filter messages", placeholder="e.g. INVITE, 401, PRACK, Call-ID")
 filtered = messages
 if filter_text.strip():
@@ -151,17 +158,47 @@ if messages:
         else:
             st.write("No SIP message body was extracted.")
 
+st.subheader("Automatic call-flow diagnostics")
+if not diagnostics:
+    st.success("No trace-level anomalies detected by the current deterministic checks.")
+else:
+    st.caption("These are conservative trace checks, not a complete RFC/3GPP conformance verdict.")
+    for finding in diagnostics:
+        text = f"Frame {finding.frame or '?'} — {finding.title}\n\n{finding.detail}"
+        if finding.severity == "error":
+            st.error(text)
+        else:
+            st.warning(text)
+
 st.subheader("Call flows")
 if not flows:
     st.warning("No SIP Call-ID could be reconstructed from the capture.")
 else:
     for index, flow in enumerate(flows, start=1):
+        flow_findings = diagnose_flow(flow)
         label = f"Flow {index} — {flow.call_id} ({len(flow.messages)} messages)"
         with st.expander(label):
+            if flow_findings:
+                st.markdown("**Flow findings**")
+                for finding in flow_findings:
+                    icon = "🔴" if finding.severity == "error" else "⚠️"
+                    st.markdown(f"{icon} **Frame {finding.frame or '?'} — {finding.title}**")
+                    st.caption(finding.detail)
+            else:
+                st.success("No trace-level anomalies detected in this flow.")
+
+            st.markdown("**SIP sequence**")
+            sequence_rows = []
             for message in flow.messages:
-                direction = f"{message.source or '?'} → {message.destination or '?'}"
-                st.markdown(f"**Frame {message.frame or '?'}** · {direction} · `{message.start_line}`")
-                st.caption(summarize_message(message))
+                sequence_rows.append(
+                    {
+                        "Frame": message.frame,
+                        "Direction": f"{message.source or '?'} → {message.destination or '?'}",
+                        "Message": message.start_line,
+                        "CSeq": message.cseq or "",
+                    }
+                )
+            st.dataframe(sequence_rows, use_container_width=True, hide_index=True)
 
 st.subheader("SIP errors")
 if errors:
