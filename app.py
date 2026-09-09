@@ -17,6 +17,41 @@ from telecom_trace_analyzer.pcap.decoder import TsharkNotFoundError, decode_sip_
 from telecom_trace_analyzer.sip.analyzer import find_sip_errors, group_by_call_id, summarize_message
 
 
+def explain_message(message) -> str:
+    """Return a deterministic, telecom-friendly explanation of a SIP message."""
+    if message.is_request:
+        descriptions = {
+            "REGISTER": "Registers the UE/contact with the IMS registrar. Check authentication and the final response.",
+            "INVITE": "Initiates a SIP session. In IMS this normally carries SDP describing the proposed media session.",
+            "ACK": "Confirms receipt of the final response to an INVITE transaction and completes the INVITE handshake.",
+            "BYE": "Terminates an established SIP session.",
+            "CANCEL": "Cancels a pending INVITE transaction before a final response is received.",
+            "PRACK": "Provides a reliable acknowledgement for a provisional response when 100rel is used.",
+            "UPDATE": "Updates session parameters before or during dialog establishment when supported.",
+            "SUBSCRIBE": "Creates or refreshes a subscription for event notifications.",
+            "NOTIFY": "Carries an event notification, commonly in response to a SUBSCRIBE.",
+            "OPTIONS": "Queries SIP endpoint capabilities and reachability.",
+            "REFER": "Requests that the recipient initiate a new referenced action, commonly call transfer.",
+        }
+        return descriptions.get(message.method or "", "SIP request; inspect its method, headers, CSeq and body for the transaction purpose.")
+
+    if message.is_response:
+        code = message.status_code or 0
+        if 100 <= code < 200:
+            return "Provisional response. The transaction is still in progress; inspect the next request/response and any reliable provisional-response handling."
+        if 200 <= code < 300:
+            return "Successful final response. Verify that the corresponding transaction/dialog proceeds to the expected next SIP message."
+        if 300 <= code < 400:
+            return "Redirection response. Check the Contact header and whether the sender follows the redirect as required by the test scenario."
+        if 400 <= code < 500:
+            return "Client-side failure response. Check the request, dialog/transaction state, authentication, headers and the exact SIP reason."
+        if 500 <= code < 600:
+            return "Server-side failure response. Investigate the receiving network element, service state, routing and upstream signaling."
+        if 600 <= code < 700:
+            return "Global failure response. The failure applies beyond a single server; correlate the transaction and network-side signaling."
+    return "SIP message extracted from the packet capture."
+
+
 st.set_page_config(page_title="Telecom Trace Analyzer", page_icon="📡", layout="wide")
 st.title("📡 Telecom Trace Analyzer")
 st.caption("V1 — PCAP → SIP extraction → call-flow inspection")
@@ -40,31 +75,81 @@ with tempfile.TemporaryDirectory(prefix="telecom_trace_") as tmp:
         st.error(f"PCAP analysis failed: {exc}")
         st.stop()
 
-st.success(f"Analysis complete: {len(messages)} SIP messages found.")
-
 flows = group_by_call_id(messages)
 errors = find_sip_errors(messages)
 
-m1, m2, m3 = st.columns(3)
+st.success(f"Analysis complete: {len(messages)} SIP messages found.")
+
+m1, m2, m3, m4 = st.columns(4)
 m1.metric("SIP messages", len(messages))
 m2.metric("Call-ID flows", len(flows))
-m3.metric("SIP errors (4xx–6xx)", len(errors))
+m3.metric("SIP errors", len(errors))
+m4.metric("Requests", sum(m.is_request for m in messages))
 
-st.subheader("SIP messages")
-rows = []
-for message in messages:
-    rows.append(
-        {
-            "Frame": message.frame,
-            "Source": message.source or "",
-            "Destination": message.destination or "",
-            "Message": message.start_line,
-            "Call-ID": message.call_id or "",
-            "CSeq": message.cseq or "",
-            "Status": message.status_code or "",
-        }
-    )
+st.subheader("SIP message explorer")
+
+filter_text = st.text_input("Filter messages", placeholder="e.g. INVITE, 401, PRACK, Call-ID")
+filtered = messages
+if filter_text.strip():
+    needle = filter_text.lower()
+    filtered = [
+        m for m in messages
+        if needle in m.start_line.lower()
+        or needle in (m.call_id or "").lower()
+        or needle in (m.cseq or "").lower()
+    ]
+
+rows = [
+    {
+        "Frame": m.frame,
+        "Time": f"{m.timestamp:.6f}" if m.timestamp is not None else "",
+        "Source": m.source or "",
+        "Destination": m.destination or "",
+        "Message": m.start_line,
+        "Call-ID": m.call_id or "",
+        "CSeq": m.cseq or "",
+        "Status": m.status_code or "",
+    }
+    for m in filtered
+]
 st.dataframe(rows, use_container_width=True, hide_index=True)
+st.caption(f"Showing {len(filtered)} of {len(messages)} SIP messages")
+
+if messages:
+    st.subheader("Explain a SIP message")
+    options = {
+        f"Frame {m.frame} — {m.start_line} — CSeq {m.cseq or 'N/A'}": i
+        for i, m in enumerate(messages)
+    }
+    selected_label = st.selectbox("Select message", list(options))
+    selected = messages[options[selected_label]]
+
+    left, right = st.columns([1, 1])
+    with left:
+        st.markdown("### What it does")
+        st.info(explain_message(selected))
+        st.markdown("### Message summary")
+        st.write(summarize_message(selected))
+    with right:
+        st.markdown("### Packet context")
+        st.write(f"**Frame:** {selected.frame or 'N/A'}")
+        st.write(f"**Source:** {selected.source or 'N/A'}")
+        st.write(f"**Destination:** {selected.destination or 'N/A'}")
+        st.write(f"**Call-ID:** {selected.call_id or 'N/A'}")
+        st.write(f"**CSeq:** {selected.cseq or 'N/A'}")
+        st.write(f"**Status:** {selected.status_code or 'N/A'}")
+
+    with st.expander("SIP headers"):
+        if selected.headers:
+            st.json(selected.headers)
+        else:
+            st.write("No SIP headers were extracted.")
+
+    with st.expander("SIP body / SDP"):
+        if selected.body:
+            st.code(selected.body, language="text")
+        else:
+            st.write("No SIP message body was extracted.")
 
 st.subheader("Call flows")
 if not flows:
@@ -75,8 +160,7 @@ else:
         with st.expander(label):
             for message in flow.messages:
                 direction = f"{message.source or '?'} → {message.destination or '?'}"
-                st.markdown(f"**Frame {message.frame or '?'}** · {direction}")
-                st.code(message.start_line)
+                st.markdown(f"**Frame {message.frame or '?'}** · {direction} · `{message.start_line}`")
                 st.caption(summarize_message(message))
 
 st.subheader("SIP errors")
