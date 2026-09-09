@@ -161,15 +161,15 @@ def _parse_raw_sip(text: str) -> SipMessage | None:
 def _extract_sip_messages(text: str) -> list[SipMessage]:
     """Extract every SIP message start found in a payload/stream."""
     text = text.replace("\r\n", "\n")
-    starts = list(re.finditer(
-        r"(?m)^(?:REGISTER|INVITE|ACK|BYE|CANCEL|PRACK|UPDATE|SUBSCRIBE|NOTIFY|OPTIONS|REFER)\s+\S+\s+SIP/2\.0\s*$|(?m)^SIP/2\.0\s+\d{3}(?:\s+.*)?$",
-        text,
-        re.I,
-    ))
+    pattern = re.compile(
+        r"^(?:REGISTER|INVITE|ACK|BYE|CANCEL|PRACK|UPDATE|SUBSCRIBE|NOTIFY|OPTIONS|REFER)\s+\S+\s+SIP/2\.0\s*$|^SIP/2\.0\s+\d{3}(?:\s+.*)?$",
+        re.I | re.M,
+    )
+    starts = list(pattern.finditer(text))
     messages: list[SipMessage] = []
     for index, match in enumerate(starts):
-        chunk = text[match.start(): starts[index + 1].start() if index + 1 < len(starts) else len(text)]
-        message = _parse_raw_sip(chunk)
+        end = starts[index + 1].start() if index + 1 < len(starts) else len(text)
+        message = _parse_raw_sip(text[match.start():end])
         if message is not None:
             messages.append(message)
     return messages
@@ -226,7 +226,6 @@ def decode_sip_messages(pcap_path: str | Path) -> list[SipMessage]:
     messages: list[SipMessage] = []
     seen_frames: set[int] = set()
 
-    # Rich dissector path.
     try:
         sip_packets = _run_tshark(tshark, path, "sip")
     except subprocess.CalledProcessError:
@@ -242,15 +241,12 @@ def decode_sip_messages(pcap_path: str | Path) -> list[SipMessage]:
         if message.frame is not None:
             seen_frames.add(message.frame)
 
-    # Explicit raw transport extraction. This is the important Cloud fallback:
-    # -e @udp.payload/@tcp.payload asks TShark for the actual bytes even when
-    # the SIP dissector did not classify the packet as SIP.
     try:
         rows = _run_transport_fields(tshark, path)
     except subprocess.CalledProcessError:
         rows = []
 
-    # UDP is message-oriented, so each datagram can be parsed independently.
+    # UDP is message-oriented, so parse each datagram independently.
     for row in rows:
         payload = _decode_hex(row.get("@udp.payload", ""))
         if not payload:
@@ -298,7 +294,6 @@ def decode_sip_messages(pcap_path: str | Path) -> list[SipMessage]:
                 data = data[overlap:]
                 seq = last_end
             if last_end is not None and seq > last_end:
-                # Gap: keep the new segment separate rather than inventing bytes.
                 stream_bytes = bytearray()
                 frame_for_offset = []
             offset = len(stream_bytes)
@@ -316,12 +311,9 @@ def decode_sip_messages(pcap_path: str | Path) -> list[SipMessage]:
             if start_frame is not None:
                 seen_frames.add(start_frame)
 
-    # Final de-duplication: the same SIP frame can be found by both dissector and raw paths.
     unique: dict[tuple[int | None, str, str | None], SipMessage] = {}
     for message in messages:
-        key = (message.frame, message.start_line, message.call_id)
-        unique[key] = message
-
+        unique[(message.frame, message.start_line, message.call_id)] = message
     result = list(unique.values())
     result.sort(key=lambda message: (message.frame is None, message.frame or 0))
     return result
