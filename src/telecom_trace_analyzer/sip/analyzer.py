@@ -43,6 +43,14 @@ def group_by_call_id(messages: list[SipMessage]) -> list[SipFlow]:
     return flows
 
 
+def is_authentication_challenge(message: SipMessage) -> bool:
+    """Return True for normal SIP authentication challenge responses."""
+    return (
+        message.is_response
+        and message.status_code in _AUTH_CHALLENGE_CODES
+    )
+
+
 def find_sip_errors(messages: list[SipMessage]) -> list[SipMessage]:
     """Return actual SIP failures, excluding normal authentication challenges."""
     return [
@@ -89,7 +97,14 @@ def diagnose_flow(flow: SipFlow) -> list[SipDiagnostic]:
         method = cseq_method(message)
         cseq_number = message.cseq.split(maxsplit=1)[0]
         if method and not any(m.is_request for m in transactions.get((cseq_number, method), [])):
-            findings.append(SipDiagnostic("warning", message.frame, "Response has no matching request in this flow", f"Observed {message.status_code} for CSeq {message.cseq}, but no matching {method} request was captured for this Call-ID."))
+            findings.append(
+                SipDiagnostic(
+                    "warning",
+                    message.frame,
+                    "Response has no matching request in this flow",
+                    f"Observed {message.status_code} for CSeq {message.cseq}, but no matching {method} request was captured for this Call-ID.",
+                )
+            )
 
     for key, messages in transactions.items():
         requests = [m for m in messages if m.is_request]
@@ -100,16 +115,34 @@ def diagnose_flow(flow: SipFlow) -> list[SipDiagnostic]:
         if method in {"ACK", "CANCEL"}:
             continue
         last = requests[-1]
-        findings.append(SipDiagnostic("warning", last.frame, f"No final response observed for {method}", f"CSeq {last.cseq} contains a {method} request, but this capture contains no final 2xx-6xx response for the transaction."))
+        findings.append(
+            SipDiagnostic(
+                "warning",
+                last.frame,
+                f"No final response observed for {method}",
+                f"CSeq {last.cseq} contains a {method} request, but this capture contains no final 2xx-6xx response for the transaction.",
+            )
+        )
 
     failures = [
-        m for m in flow.messages
-        if m.is_response and m.status_code is not None
-        and m.status_code >= 400 and m.status_code not in _AUTH_CHALLENGE_CODES
+        m
+        for m in flow.messages
+        if m.is_response
+        and m.status_code is not None
+        and m.status_code >= 400
+        and m.status_code not in _AUTH_CHALLENGE_CODES
     ]
     if failures:
         first = min(failures, key=lambda m: m.frame if m.frame is not None else 10**18)
-        findings.insert(0, SipDiagnostic("error", first.frame, f"First SIP failure: {first.status_code} {first.reason or ''}".strip(), f"This is the first non-authentication 4xx/5xx/6xx response observed in the Call-ID flow. Start root-cause analysis at frame {first.frame or 'N/A'} and correlate the request, CSeq, headers and preceding messages."))
+        findings.insert(
+            0,
+            SipDiagnostic(
+                "error",
+                first.frame,
+                f"First SIP failure: {first.status_code} {first.reason or ''}".strip(),
+                f"This is the first non-authentication 4xx/5xx/6xx response observed in the Call-ID flow. Start root-cause analysis at frame {first.frame or 'N/A'} and correlate the request, CSeq, headers and preceding messages.",
+            ),
+        )
 
     return findings
 
