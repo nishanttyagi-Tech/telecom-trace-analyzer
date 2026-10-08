@@ -103,3 +103,52 @@ Do not commit confidential, customer, operator, or work-related PCAP files to th
 ## License
 
 MIT License. See `LICENSE`.
+
+
+## QCSuper-inspired Qualcomm / 5G workflow
+
+The analyzer can work as the **analysis layer after a Qualcomm DIAG capture**.
+
+```text
+Qualcomm UE / modem
+        |
+        v
+ QCSuper / QXDM / PCAP
+        |
+        v
+Telecom Trace Analyzer
+        |
+   +----+-----+------+
+   |          |      |
+  NAS        RRC   IMS/SIP
+   |          |      |
+   +----------+------+
+              |
+              v
+          Wireshark
+```
+
+### Current addition
+
+`src/telecom_trace_analyzer/qc_capture.py` provides:
+
+- PCAP/PCAPNG metadata decoding through TShark
+- protocol filter generation for 5G SA, 5G NAS, NR RRC, LTE S1AP/NAS/RRC, SIP, GTP and PFCP
+- local Wireshark launch with a protocol filter
+
+This is **analysis-only**. It does not root phones, enable Qualcomm DIAG ports, alter modem configuration, or capture from devices.
+
+Example:
+
+```bash
+python -m telecom_trace_analyzer.qc_capture capture.pcap --protocols "5G SA / NGAP" "5G NAS" --open
+```
+
+### Next milestones
+
+1. 5G SA registration-flow reconstruction
+2. RRC + NAS correlation by frame/time
+3. IMS registration and VoNR call-flow correlation
+4. abnormal-sequence detection
+5. KPI extraction and engineer-friendly root-cause analysis
+6. optional QCSuper capture integration
